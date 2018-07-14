@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"math"
 	"crypto/sha256"
+	"runtime"
 )
 
-const targetBits = 18
+const targetBits = 24
 
 type ProofOfWork struct {
 	block  *Block
@@ -53,26 +54,59 @@ func (pow *ProofOfWork) prepareData(nonce int) []byte {
 
 const maxNonce = math.MaxInt64
 
+type work struct {
+	FromNonce int
+	ToNonce   int
+}
+
+type result struct {
+	Nonce int
+	Hash  []byte
+}
+
 func (pow *ProofOfWork) Run() (int, []byte) {
-	var hashInt big.Int
-	var hash [32]byte
-	nonce := 0
 
+	resultChan := make(chan result)
+	workChan := make(chan work, 1)
+	for workers := 0; workers <= runtime.NumCPU(); workers++ {
+		go func(resultChan chan result, workChan chan work) {
+			for batch := range workChan {
+				var hashInt big.Int
+				var hash [32]byte
+				for nonce := batch.FromNonce; nonce < batch.ToNonce; nonce ++ {
+					data := pow.prepareData(nonce)
+					hash = sha256.Sum256(data)
+					//fmt.Printf("\r%x", hash)
+					hashInt.SetBytes(hash[:])
+
+					if hashInt.Cmp(pow.target) == -1 {
+						resultChan <- result{nonce, hash[:]}
+						return
+					} else {
+						nonce++
+					}
+
+				}
+
+			}
+		}(resultChan, workChan)
+
+	}
 	fmt.Printf("Mining the block containing \"%s\"\n", pow.block.Data)
-	for nonce < maxNonce {
-		data := pow.prepareData(nonce)
-		hash = sha256.Sum256(data)
-		fmt.Printf("\r%x", hash)
-		hashInt.SetBytes(hash[:])
-
-		if hashInt.Cmp(pow.target) == -1 {
-			break
-		} else {
-			nonce++
+	minNonce := 0
+	for nonce := 1000; nonce < maxNonce; nonce += 1000 {
+		select {
+		case r := <-resultChan:
+			return r.Nonce, r.Hash
+		default:
+			batch := work{minNonce, nonce}
+			workChan <- batch
+			minNonce = nonce
 		}
 	}
+
 	fmt.Println("\n\n")
-	return nonce, hash[:]
+	return 0, []byte{}
 }
 
 func (pow *ProofOfWork) Validate() bool {

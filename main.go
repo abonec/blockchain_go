@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"crypto/sha256"
 	"time"
-	"fmt"
+	"github.com/boltdb/bolt"
 )
 
 type Block struct {
@@ -17,7 +17,8 @@ type Block struct {
 }
 
 type Blockchain struct {
-	blocks []*Block
+	tip []byte
+	db  *bolt.DB
 }
 
 func (b *Block) SetHash() {
@@ -28,9 +29,33 @@ func (b *Block) SetHash() {
 }
 
 func (chain *Blockchain) AddBlock(data string) {
-	prevBlock := chain.blocks[len(chain.blocks)-1]
-	block := NewBlock(data, prevBlock.Hash)
-	chain.blocks = append(chain.blocks, block)
+	var lastHash []byte
+
+	err := chain.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		lastHash = b.Get([]byte("l"))
+		return nil
+	})
+	warning(err, "error while reading tip from db")
+
+	newBlock := NewBlock(data, lastHash)
+
+	err = chain.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		err := b.Put(newBlock.Hash, newBlock.Serialize())
+		warning(err, "error while saving new block in db")
+		if err != nil {
+			return err
+		}
+		err = b.Put([]byte("l"), newBlock.Hash)
+		warning(err, "error while saving tip in db")
+		if err != nil {
+			return err
+		}
+		chain.tip = newBlock.Hash
+
+		return nil
+	})
 }
 
 func NewBlock(data string, prevBlockHash []byte) *Block {
@@ -47,23 +72,45 @@ func NewGenesisBlock() *Block {
 	return NewBlock("Genesis block", []byte{})
 }
 
+const dbFile = "./db.bolt"
+const blocksBucket = "blocksBucket"
+
 func NewBlockchain() *Blockchain {
-	return &Blockchain{blocks: []*Block{NewGenesisBlock()}}
+	var tip []byte
+	db, err := bolt.Open(dbFile, 0600, nil)
+	warning(err, "error while opening db file "+dbFile)
+	err = db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(blocksBucket))
+		if b == nil {
+			genesis := NewGenesisBlock()
+			b, err := tx.CreateBucket([]byte(blocksBucket))
+			warning(err, "error while creating bucket")
+			if err != nil {
+				return err
+			}
+			err = b.Put(genesis.Hash, genesis.Serialize())
+			warning(err, "error while saving genesis block")
+			if err != nil {
+				return err
+			}
+			err = b.Put([]byte("l"), genesis.Hash)
+			warning(err, "error while saving tip of the blockchain")
+			if err != nil {
+				return err
+			}
+			tip = genesis.Hash
+		} else {
+			tip = b.Get([]byte("l"))
+		}
+		return nil
+	})
+	return &Blockchain{tip, db}
 }
 
 func main() {
 	chain := NewBlockchain()
+	defer chain.db.Close()
 
-	chain.AddBlock("Send 1 BTC to somebody")
-	chain.AddBlock("Send 100 BTC to someone")
-
-	for _, block := range chain.blocks {
-		fmt.Printf("PrevHash: %x\n", block.PrevBlockHash)
-		fmt.Printf("Data: %s\n", block.Data)
-		fmt.Printf("Hash: %x\n", block.Hash)
-		pow := NewProofOfWork(block)
-		fmt.Printf("PoW: %s\n", strconv.FormatBool(pow.Validate()))
-		fmt.Println()
-		fmt.Printf("=================\n")
-	}
+	cli := CLI{chain}
+	cli.Run()
 }
